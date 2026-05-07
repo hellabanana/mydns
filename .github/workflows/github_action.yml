@@ -1,0 +1,44 @@
+name: DNS Block&Redirect Configurer cron task
+
+on:
+  schedule:
+    - cron: '30 1 * * *' # 04:30 MSK (01:30 UTC)
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: DNS
+
+    env:
+      BLOCK: ${{ vars.BLOCK }}
+      REDIRECT: ${{ vars.REDIRECT }}
+      EXCLUDE_REDIRECT: ${{ vars.EXCLUDE_REDIRECT }}
+
+      CLIENT_ID: ${{ secrets.CLIENT_ID }}
+      AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+
+      TZ: Europe/Moscow
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Run self-test
+        run: dotnet run --configuration Release --no-build -- --self-test
+
+      - name: Run application
+        run: |
+          echo "Starting application..."
+          dotnet run --configuration Release --no-build
