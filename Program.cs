@@ -172,6 +172,8 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
 
 internal sealed class NextDnsClient(HttpClient httpClient, DnsProfile profile)
 {
+    private const int MaxTransientAttempts = 3;
+    private static readonly TimeSpan TransientRetryDelay = TimeSpan.FromSeconds(10);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
@@ -214,8 +216,55 @@ internal sealed class NextDnsClient(HttpClient httpClient, DnsProfile profile)
     private async Task<TResponse?> SendAsync<TResponse>(HttpMethod method, string path, object? body = null)
         where TResponse : NextDnsResponseBase
     {
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                using HttpRequestMessage request = CreateRequest(method, path, body);
+                using HttpResponseMessage response = await httpClient.SendAsync(request);
+                string responseBody = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    NextDnsHttpException httpException = new(response.StatusCode, responseBody);
+                    switch (response.StatusCode)
+                    {
+                        case HttpStatusCode.Unauthorized:
+                        case HttpStatusCode.Forbidden:
+                            throw new ProcessException("Invalid NextDNS API key");
+                        case HttpStatusCode.NotFound:
+                            throw new ProcessException("Make sure AUTH_SECRET and CLIENT_ID belong to the same NextDNS account");
+                        default:
+                            throw httpException;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(responseBody))
+                {
+                    return null;
+                }
+
+                return JsonSerializer.Deserialize<TResponse>(responseBody, JsonOptions);
+            }
+            catch (Exception exception) when (IsTransientNetworkException(exception))
+            {
+                if (attempt >= MaxTransientAttempts)
+                {
+                    throw new ProcessException(
+                        $"NextDNS request failed after {MaxTransientAttempts} attempts: {method} {path}. {exception.Message}");
+                }
+
+                ConsoleLogger.Common(
+                    $"NextDNS request failed: {method} {path}. Retrying in {TransientRetryDelay.TotalSeconds:N0} seconds ({attempt}/{MaxTransientAttempts})");
+                await Task.Delay(TransientRetryDelay);
+            }
+        }
+    }
+
+    private HttpRequestMessage CreateRequest(HttpMethod method, string path, object? body)
+    {
         Uri uri = new(ApiUrl + path);
-        using HttpRequestMessage request = new(method, uri);
+        HttpRequestMessage request = new(method, uri);
         request.Headers.Add("X-Api-Key", profile.AuthSecret);
 
         if (body is not null)
@@ -223,30 +272,12 @@ internal sealed class NextDnsClient(HttpClient httpClient, DnsProfile profile)
             request.Content = JsonContent.Create(body, options: JsonOptions);
         }
 
-        using HttpResponseMessage response = await httpClient.SendAsync(request);
-        string responseBody = await response.Content.ReadAsStringAsync();
+        return request;
+    }
 
-        if (!response.IsSuccessStatusCode)
-        {
-            NextDnsHttpException httpException = new(response.StatusCode, responseBody);
-            switch (response.StatusCode)
-            {
-                case HttpStatusCode.Unauthorized:
-                case HttpStatusCode.Forbidden:
-                    throw new ProcessException("Invalid NextDNS API key");
-                case HttpStatusCode.NotFound:
-                    throw new ProcessException("Make sure AUTH_SECRET and CLIENT_ID belong to the same NextDNS account");
-                default:
-                    throw httpException;
-            }
-        }
-
-        if (string.IsNullOrWhiteSpace(responseBody))
-        {
-            return null;
-        }
-
-        return JsonSerializer.Deserialize<TResponse>(responseBody, JsonOptions);
+    private static bool IsTransientNetworkException(Exception exception)
+    {
+        return exception is HttpRequestException or TaskCanceledException;
     }
 }
 
