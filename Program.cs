@@ -14,19 +14,17 @@ try
 {
     using HttpClient httpClient = new();
     AppSettings settings = EnvironmentParser.Load();
+    const int maxParallelProfiles = 3;
+    int parallelProfiles = Math.Min(settings.Profiles.Count, maxParallelProfiles);
 
-    foreach (DnsProfile profile in settings.Profiles)
-    {
-        ConsoleLogger.Global($"Setting up profile {profile.Number} (NextDNS)");
+    ConsoleLogger.Common($"Processing {settings.Profiles.Count} profile(s), up to {parallelProfiles} in parallel");
 
-        NextDnsClient client = new(httpClient, profile);
-        HostsListLoader hostsListLoader = new(httpClient);
-        NextDnsRunner runner = new(client, hostsListLoader, settings);
+    using SemaphoreSlim profileSemaphore = new(parallelProfiles);
+    Task[] profileTasks = settings.Profiles
+        .Select(profile => RunProfileAsync(profile, httpClient, settings, profileSemaphore))
+        .ToArray();
 
-        await runner.RunAsync();
-
-        ConsoleLogger.Global($"Profile {profile.Number} (NextDNS) set up successfully");
-    }
+    await Task.WhenAll(profileTasks);
 }
 catch (ProcessException exception)
 {
@@ -38,6 +36,31 @@ catch (Exception exception)
     ConsoleLogger.Fail("Unexpected exception");
     Console.WriteLine(exception);
     Environment.ExitCode = 1;
+}
+
+static async Task RunProfileAsync(
+    DnsProfile profile,
+    HttpClient httpClient,
+    AppSettings settings,
+    SemaphoreSlim profileSemaphore)
+{
+    await profileSemaphore.WaitAsync();
+    try
+    {
+        ConsoleLogger.Global($"Setting up profile {profile.Number} (NextDNS)");
+
+        NextDnsClient client = new(httpClient, profile);
+        HostsListLoader hostsListLoader = new(httpClient);
+        NextDnsRunner runner = new(client, hostsListLoader, settings);
+
+        await runner.RunAsync();
+
+        ConsoleLogger.Global($"Profile {profile.Number} (NextDNS) set up successfully");
+    }
+    finally
+    {
+        profileSemaphore.Release();
+    }
 }
 
 internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsListLoader, AppSettings settings)
@@ -235,6 +258,20 @@ internal sealed class NextDnsClient(HttpClient httpClient, DnsProfile profile)
                         case HttpStatusCode.NotFound:
                             throw new ProcessException("Make sure AUTH_SECRET and CLIENT_ID belong to the same NextDNS account");
                         default:
+                            if (IsTransientHttpStatusCode(response.StatusCode))
+                            {
+                                if (attempt >= MaxTransientAttempts)
+                                {
+                                    throw new ProcessException(
+                                        $"NextDNS HTTP request failed after {MaxTransientAttempts} attempts: {method} {path}. Last response: {(int)response.StatusCode}: {responseBody}");
+                                }
+
+                                ConsoleLogger.Common(
+                                    $"NextDNS HTTP error {(int)response.StatusCode}: {method} {path}. Retrying in {TransientRetryDelay.TotalSeconds:N0} seconds ({attempt}/{MaxTransientAttempts})");
+                                await Task.Delay(TransientRetryDelay);
+                                continue;
+                            }
+
                             throw httpException;
                     }
                 }
@@ -278,6 +315,12 @@ internal sealed class NextDnsClient(HttpClient httpClient, DnsProfile profile)
     private static bool IsTransientNetworkException(Exception exception)
     {
         return exception is HttpRequestException or TaskCanceledException;
+    }
+
+    private static bool IsTransientHttpStatusCode(HttpStatusCode statusCode)
+    {
+        int code = (int)statusCode;
+        return code is >= 500 and <= 599 and not 524;
     }
 }
 
@@ -519,47 +562,6 @@ internal static class EnvironmentParser
         return values;
     }
 }
-
-internal sealed record AppSettings(
-    IReadOnlyList<DnsProfile> Profiles,
-    IReadOnlyList<string> BlockSources,
-    IReadOnlyList<string> RedirectSources,
-    IReadOnlyList<string> ExcludedRedirects)
-{
-    public bool ShouldExcludeRedirect(string domain)
-    {
-        return ExcludedRedirects.Any(excluded => domain.EndsWith(excluded, StringComparison.OrdinalIgnoreCase));
-    }
-}
-
-internal sealed record DnsProfile(int Number, string ClientId, string AuthSecret);
-
-internal sealed record HostsLine(string? Ip, string? Domain);
-
-internal sealed record BypassRoute(string Ip, string Website);
-
-internal sealed record CreateDenyRequest(string Id)
-{
-    public bool Active { get; init; } = true;
-}
-
-internal sealed record CreateRewriteRequest(string Name, string Content);
-
-internal sealed record DenyDto(string Id, bool Active);
-
-internal sealed record RewriteDto(string Id, string Name, string Content);
-
-internal abstract class NextDnsResponseBase
-{
-    public List<NextDnsApiError>? Errors { get; set; }
-}
-
-internal sealed class NextDnsResponse<T> : NextDnsResponseBase
-{
-    public T? Data { get; set; }
-}
-
-internal sealed record NextDnsApiError(string Code);
 
 internal sealed class ProcessException(string message) : Exception(message);
 
