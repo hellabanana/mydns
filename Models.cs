@@ -2,11 +2,14 @@ internal sealed record AppSettings(
     IReadOnlyList<DnsProfile> Profiles,
     IReadOnlyList<string> BlockSources,
     IReadOnlyList<string> RedirectSources,
-    IReadOnlyList<string> ExcludedRedirects)
+    IReadOnlyList<string> ExcludedRedirects,
+    IReadOnlySet<string> RequiredRedirects)
 {
     public bool ShouldExcludeRedirect(string domain)
     {
-        return ExcludedRedirects.Any(excluded => domain.EndsWith(excluded, StringComparison.OrdinalIgnoreCase));
+        return ExcludedRedirects.Any(excluded => excluded.Contains('.')
+            ? domain.EndsWith(excluded, StringComparison.OrdinalIgnoreCase)
+            : domain.Contains(excluded, StringComparison.OrdinalIgnoreCase));
     }
 }
 

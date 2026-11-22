@@ -36,14 +36,16 @@ AUTH_SECRET=api_key_1,api_key_2
 
 - `BLOCK` - URLs to hosts files with domains to block.
 - `REDIRECT` - URLs to hosts files with DNS rewrites.
-- `EXCLUDE_REDIRECT` - domains to exclude from rewrites.
+- `REQUIRED_REDIRECT` - comma-separated domains or patterns from `REDIRECT` to save first. `*.openai.com` matches `openai.com` and its subdomains at any depth. `*.openai.*` also matches other suffixes, such as `openai.net`. A standalone `*` matches every domain. `EXCLUDE_REDIRECT` still applies. The sync reports an error if a pattern has no eligible matches or if the required rewrites exceed the available slots.
+- `EXCLUDE_REDIRECT` - comma-separated exclusions for rewrites. An entry without a dot, such as `rutor`, matches anywhere in the domain name. An entry with a dot matches the end of the name. Matching is case-insensitive.
 
 Multiple sources or domains are separated by commas:
 
 ```text
 BLOCK=https://first.example/hosts,https://second.example/hosts
 REDIRECT=https://example.com/redirect-hosts
-EXCLUDE_REDIRECT=instagram.com,twitch.com
+REQUIRED_REDIRECT=*.openai.*,*.chatgpt.com
+EXCLUDE_REDIRECT=rutor,instagram.com,twitch.com
 ```
 
 ## Hosts File Format
@@ -76,7 +78,7 @@ When `REDIRECT` is provided, the app downloads the sources, keeps `IP domain` pa
 - adds new rules;
 - removes and skips domains from `EXCLUDE_REDIRECT`.
 
-If `BLOCK` is empty, Denylist is not changed. If `REDIRECT` is empty, Rewrites are not changed. If both `BLOCK` and `REDIRECT` are empty, the app removes all Denylist and Rewrites entries in the profile.
+At the start of each profile sync, the app removes existing rewrites that match `EXCLUDE_REDIRECT`, even when `REDIRECT` is empty. With only `EXCLUDE_REDIRECT` set, the sync performs only that cleanup. If `BLOCK`, `REDIRECT`, and `EXCLUDE_REDIRECT` are all empty, the app removes all Denylist and Rewrites entries in the profile.
 
 ## GitHub Actions
 
@@ -84,7 +86,7 @@ If `BLOCK` is empty, Denylist is not changed. If `REDIRECT` is empty, Rewrites a
 2. Go to Settings -> Environments.
 3. Create an environment named `DNS`.
 4. Add `CLIENT_ID` and `AUTH_SECRET` to Environment secrets.
-5. Add `BLOCK`, `REDIRECT`, and `EXCLUDE_REDIRECT` to Environment variables.
+5. Add `BLOCK`, `REDIRECT`, `REQUIRED_REDIRECT`, and `EXCLUDE_REDIRECT` as needed to Environment variables.
 
 The workflow runs daily at `01:30 UTC` and can also be started manually from the Actions tab.
 
@@ -97,10 +99,15 @@ To change the schedule, edit the cron expression in `.github/workflows/github_ac
 ```shell
 dotnet restore
 dotnet build
+```
+
+To run against a test NextDNS profile, copy `.env.example` to `.env` and fill in the test profile ID and API key. Run from the project directory. The app loads `.env` from the working directory, and existing environment variables take precedence.
+
+```shell
 dotnet run
 ```
 
-To validate parsing without calling the NextDNS API:
+To run the self-test without calling the NextDNS API:
 
 ```shell
 dotnet run -- --self-test

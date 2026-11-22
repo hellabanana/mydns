@@ -69,6 +69,14 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
 
     public async Task RunAsync()
     {
+        List<RewriteDto>? existingRewrites = null;
+        if (settings.ExcludedRedirects.Count > 0)
+        {
+            ConsoleLogger.Step("Apply rewrite exclusions");
+            existingRewrites = await FetchExistingRewritesAsync();
+            await RemoveExcludedRewritesAsync(existingRewrites);
+        }
+
         if (settings.BlockSources.Count > 0)
         {
             ConsoleLogger.Step($"Obtain block lists from {settings.BlockSources.Count} sources");
@@ -101,17 +109,32 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
 
             ConsoleLogger.Step("Prepare rewrites");
             Dictionary<string, CreateRewriteRequest> newRewrites = BuildNewRewrites(overrides);
-            List<CreateRewriteRequest> rewritesToCreate = await PrepareRewritesAsync(newRewrites);
+            HashSet<string> requiredNames = FindRequiredRewriteNames(newRewrites.Keys);
+            existingRewrites ??= await FetchExistingRewritesAsync();
+            List<CreateRewriteRequest> rewritesToCreate = await PrepareRewritesAsync(newRewrites, requiredNames, existingRewrites);
 
             ConsoleLogger.Step("Save rewrites");
-            await NextDnsRateLimitedApiProcessor.CallApiAsync(rewritesToCreate, client.SaveRewriteAsync);
+            List<CreateRewriteRequest> requiredRewrites = rewritesToCreate
+                .Where(request => requiredNames.Contains(request.Name))
+                .ToList();
+            if (requiredRewrites.Count > 0)
+            {
+                int saved = await NextDnsRateLimitedApiProcessor.CallApiAsync(requiredRewrites, client.SaveRewriteAsync);
+                if (saved != requiredRewrites.Count)
+                {
+                    throw new ProcessException($"Profile {client.ProfileNumber}: NextDNS saved only {saved} of {requiredRewrites.Count} required rewrites");
+                }
+            }
+
+            await NextDnsRateLimitedApiProcessor.CallApiAsync(
+                rewritesToCreate.Skip(requiredRewrites.Count).ToList(), client.SaveRewriteAsync);
         }
         else
         {
             ConsoleLogger.Fail("No rewrite sources provided");
         }
 
-        if (settings.BlockSources.Count == 0 && settings.RedirectSources.Count == 0)
+        if (settings.BlockSources.Count == 0 && settings.RedirectSources.Count == 0 && settings.ExcludedRedirects.Count == 0)
         {
             ConsoleLogger.Step("Remove settings");
             await RemoveAllAsync();
@@ -130,25 +153,87 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
         return rewriteRequests;
     }
 
-    private async Task<List<CreateRewriteRequest>> PrepareRewritesAsync(
-        Dictionary<string, CreateRewriteRequest> newRewriteRequests)
+    private HashSet<string> FindRequiredRewriteNames(IReadOnlyCollection<string> sourceNames)
+    {
+        HashSet<string> requiredNames = new(StringComparer.OrdinalIgnoreCase);
+        foreach (string pattern in settings.RequiredRedirects)
+        {
+            Regex matcher = BuildRequiredRedirectMatcher(pattern);
+            List<string> matches = sourceNames
+                .Where(name => matcher.IsMatch(name) && !settings.ShouldExcludeRedirect(name))
+                .ToList();
+            if (matches.Count == 0)
+            {
+                throw new ProcessException($"Profile {client.ProfileNumber}: REQUIRED_REDIRECT pattern '{pattern}' matched no domains allowed by EXCLUDE_REDIRECT in the REDIRECT sources");
+            }
+
+            requiredNames.UnionWith(matches);
+        }
+
+        return requiredNames;
+    }
+
+    internal static Regex BuildRequiredRedirectMatcher(string pattern)
+    {
+        const RegexOptions options = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
+        if (pattern == "*")
+        {
+            return new Regex(@".+", options);
+        }
+
+        bool anyPrefix = pattern.StartsWith("*.", StringComparison.Ordinal);
+        bool anySuffix = pattern.EndsWith(".*", StringComparison.Ordinal);
+        int start = anyPrefix ? 2 : 0;
+        int end = anySuffix ? pattern.Length - 2 : pattern.Length;
+        string domain = end > start ? pattern[start..end] : "";
+        if (domain.Length == 0 || domain.Contains('*') || domain.Any(char.IsWhiteSpace))
+        {
+            throw new ProcessException($"Invalid REQUIRED_REDIRECT pattern '{pattern}'. Use an exact domain, *.example.com, or *.example.*");
+        }
+
+        string prefix = anyPrefix ? @"(?:[^.]+\.)*" : "";
+        string suffix = anySuffix ? @"(?:\.[^.]+)+" : "";
+        return new Regex(@"\A" + prefix + Regex.Escape(domain) + suffix + @"\z", options);
+    }
+
+    private Task<List<RewriteDto>> FetchExistingRewritesAsync()
     {
         ConsoleLogger.Io("Fetching existing rewrites from NextDNS");
-        List<RewriteDto> existingRewrites = await client.FetchRewritesAsync();
+        return client.FetchRewritesAsync();
+    }
 
+    private async Task RemoveExcludedRewritesAsync(List<RewriteDto> existingRewrites)
+    {
+        List<string> excludedIds = existingRewrites
+            .Where(rewrite => settings.ShouldExcludeRedirect(rewrite.Name))
+            .Select(rewrite => rewrite.Id)
+            .ToList();
+        if (excludedIds.Count == 0)
+        {
+            return;
+        }
+
+        ConsoleLogger.Io($"Removing {excludedIds.Count} excluded rewrites from NextDNS");
+        int removedCount = await NextDnsRateLimitedApiProcessor.CallApiAsync(excludedIds, client.DeleteRewriteByIdAsync);
+        if (removedCount != excludedIds.Count)
+        {
+            throw new ProcessException($"Profile {client.ProfileNumber}: NextDNS failed to remove one or more excluded rewrites");
+        }
+
+        existingRewrites.RemoveAll(rewrite => settings.ShouldExcludeRedirect(rewrite.Name));
+    }
+
+    private async Task<List<CreateRewriteRequest>> PrepareRewritesAsync(
+        Dictionary<string, CreateRewriteRequest> newRewriteRequests,
+        IReadOnlySet<string> requiredNames,
+        IReadOnlyCollection<RewriteDto> existingRewrites)
+    {
         List<string> outdatedIds = [];
-        List<string> excludedIds = [];
         HashSet<string> outdatedNames = new(StringComparer.OrdinalIgnoreCase);
         HashSet<string> matchingNames = new(StringComparer.OrdinalIgnoreCase);
 
         foreach (RewriteDto existingRewrite in existingRewrites)
         {
-            if (settings.ShouldExcludeRedirect(existingRewrite.Name))
-            {
-                excludedIds.Add(existingRewrite.Id);
-                continue;
-            }
-
             if (newRewriteRequests.TryGetValue(existingRewrite.Name, out CreateRewriteRequest? request))
             {
                 if (!string.Equals(request.Content, existingRewrite.Content, StringComparison.OrdinalIgnoreCase))
@@ -163,30 +248,35 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
             }
         }
 
-        int removedCount = 0;
+        List<CreateRewriteRequest> pendingRewrites = newRewriteRequests.Values
+            .Where(request => !matchingNames.Contains(request.Name) && !settings.ShouldExcludeRedirect(request.Name))
+            .OrderByDescending(request => requiredNames.Contains(request.Name))
+            .ThenByDescending(request => outdatedNames.Contains(request.Name))
+            .ToList();
+
+        int availableSlots = Math.Max(0, RewriteLimit - (existingRewrites.Count - outdatedIds.Count));
+        int optionalReplacements = pendingRewrites.Count(request =>
+            outdatedNames.Contains(request.Name) && !requiredNames.Contains(request.Name));
+        List<string> requiredWithoutSlots = pendingRewrites.Where(request => requiredNames.Contains(request.Name))
+            .Skip(Math.Max(0, availableSlots - optionalReplacements))
+            .Select(request => request.Name)
+            .ToList();
+        if (requiredWithoutSlots.Count > 0)
+        {
+            throw new ProcessException($"Profile {client.ProfileNumber}: Free {requiredWithoutSlots.Count} NextDNS rewrite slot(s) for required domains: " +
+                string.Join(", ", requiredWithoutSlots));
+        }
+
         if (outdatedIds.Count > 0)
         {
             ConsoleLogger.Io($"Removing {outdatedIds.Count} outdated rewrites from NextDNS");
-            removedCount += await NextDnsRateLimitedApiProcessor.CallApiAsync(outdatedIds, client.DeleteRewriteByIdAsync);
+            int removedCount = await NextDnsRateLimitedApiProcessor.CallApiAsync(outdatedIds, client.DeleteRewriteByIdAsync);
+            if (removedCount != outdatedIds.Count)
+            {
+                throw new ProcessException($"Profile {client.ProfileNumber}: NextDNS failed to remove one or more outdated rewrites");
+            }
         }
 
-        if (excludedIds.Count > 0)
-        {
-            ConsoleLogger.Io($"Removing {excludedIds.Count} excluded rewrites from NextDNS");
-            removedCount += await NextDnsRateLimitedApiProcessor.CallApiAsync(excludedIds, client.DeleteRewriteByIdAsync);
-        }
-
-        if (removedCount != outdatedIds.Count + excludedIds.Count)
-        {
-            throw new ProcessException($"Profile {client.ProfileNumber}: NextDNS failed to remove one or more rewrites");
-        }
-
-        List<CreateRewriteRequest> pendingRewrites = newRewriteRequests.Values
-            .Where(request => !matchingNames.Contains(request.Name) && !settings.ShouldExcludeRedirect(request.Name))
-            .OrderByDescending(request => outdatedNames.Contains(request.Name))
-            .ToList();
-
-        int availableSlots = Math.Max(0, RewriteLimit - (existingRewrites.Count - removedCount));
         if (pendingRewrites.Count > availableSlots)
         {
             ConsoleLogger.Warn($"Profile {client.ProfileNumber}: NextDNS rewrite limit is {RewriteLimit}. " +
@@ -203,8 +293,7 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
         ConsoleLogger.Io("Removing denylist from NextDNS");
         await NextDnsRateLimitedApiProcessor.CallApiAsync(denyList.Select(item => item.Id).ToList(), client.DeleteDenyByIdAsync);
 
-        ConsoleLogger.Io("Fetching existing rewrites from NextDNS");
-        List<RewriteDto> rewrites = await client.FetchRewritesAsync();
+        List<RewriteDto> rewrites = await FetchExistingRewritesAsync();
         ConsoleLogger.Io("Removing rewrites from NextDNS");
         await NextDnsRateLimitedApiProcessor.CallApiAsync(rewrites.Select(item => item.Id).ToList(), client.DeleteRewriteByIdAsync);
     }
@@ -538,8 +627,12 @@ internal static class EnvironmentParser
 {
     public static AppSettings Load()
     {
-        List<string> clientIds = ParseRequiredCsv("CLIENT_ID");
-        List<string> secrets = ParseRequiredCsv("AUTH_SECRET");
+        Dictionary<string, string> fileSettings = ReadDotEnv();
+        string? ReadSetting(string key) =>
+            Environment.GetEnvironmentVariable(key) ?? fileSettings.GetValueOrDefault(key);
+
+        List<string> clientIds = ParseRequiredCsv("CLIENT_ID", ReadSetting("CLIENT_ID"));
+        List<string> secrets = ParseRequiredCsv("AUTH_SECRET", ReadSetting("AUTH_SECRET"));
 
         if (clientIds.Count != secrets.Count)
         {
@@ -553,16 +646,57 @@ internal static class EnvironmentParser
             profiles.Add(new DnsProfile(i + 1, clientIds[i], secrets[i]));
         }
 
-        List<string> excludedRedirects = ParseCsv(Environment.GetEnvironmentVariable("EXCLUDE_REDIRECT"))
+        List<string> excludedRedirects = ParseCsv(ReadSetting("EXCLUDE_REDIRECT"))
             .Select(domain => HostsListLoader.RemoveWww(domain.Trim().ToLowerInvariant()))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+        HashSet<string> requiredRedirects = ParseCsv(ReadSetting("REQUIRED_REDIRECT"))
+            .Select(pattern => pattern.Contains('*') ? pattern : HostsListLoader.RemoveWww(pattern))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        List<string> redirectSources = ParseCsv(ReadSetting("REDIRECT"));
+        if (requiredRedirects.Count > 0 && redirectSources.Count == 0)
+        {
+            throw new ProcessException("REQUIRED_REDIRECT requires at least one REDIRECT source");
+        }
+
         return new AppSettings(
             profiles,
-            ParseCsv(Environment.GetEnvironmentVariable("BLOCK")),
-            ParseCsv(Environment.GetEnvironmentVariable("REDIRECT")),
-            excludedRedirects);
+            ParseCsv(ReadSetting("BLOCK")),
+            redirectSources,
+            excludedRedirects,
+            requiredRedirects);
+    }
+
+    private static Dictionary<string, string> ReadDotEnv()
+    {
+        const string fileName = ".env";
+        Dictionary<string, string> settings = new(StringComparer.Ordinal);
+        if (!File.Exists(fileName))
+        {
+            return settings;
+        }
+
+        foreach (string rawLine in File.ReadLines(fileName))
+        {
+            string line = rawLine.Trim();
+            int separator = line.IndexOf('=');
+            if (separator <= 0 || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            string key = line[..separator].TrimEnd();
+            string value = line[(separator + 1)..].Trim();
+            if (value.Length >= 2 && (value[0] is '\'' or '"') && value[^1] == value[0])
+            {
+                value = value[1..^1];
+            }
+
+            settings[key] = value;
+        }
+
+        return settings;
     }
 
     public static List<string> ParseCsv(string? value)
@@ -578,9 +712,9 @@ internal static class EnvironmentParser
             .ToList();
     }
 
-    private static List<string> ParseRequiredCsv(string key)
+    private static List<string> ParseRequiredCsv(string key, string? value)
     {
-        List<string> values = ParseCsv(Environment.GetEnvironmentVariable(key));
+        List<string> values = ParseCsv(value);
         if (values.Count == 0)
         {
             throw new ProcessException($"Mandatory environment variable is not provided: {key}");
@@ -643,10 +777,23 @@ internal static class SelfTest
         List<string> values = EnvironmentParser.ParseCsv("first, second,,third");
         Assert(values.SequenceEqual(["first", "second", "third"]), "CSV parsing failed");
 
-        AppSettings settings = new([], [], [], ["example.com"]);
+        AppSettings settings = new([], [], [], ["example.com", "rutor"], new HashSet<string>());
         Assert(settings.ShouldExcludeRedirect("sub.example.com"), "subdomain exclusion failed");
+        Assert(settings.ShouldExcludeRedirect("RuTor.info") && settings.ShouldExcludeRedirect("tracker.new-rutor.is"),
+            "fragment exclusion failed");
+        Assert(!settings.ShouldExcludeRedirect("example.com.other") && !settings.ShouldExcludeRedirect("unrelated.test"),
+            "exclusion matched an unrelated domain");
+
+        Regex openAiPattern = NextDnsRunner.BuildRequiredRedirectMatcher("*.openai.*");
+        Assert(openAiPattern.IsMatch("OPENAI.com") && openAiPattern.IsMatch("android.chat.openai.com") &&
+            openAiPattern.IsMatch("api.openai.net") && !openAiPattern.IsMatch("notopenai.com") &&
+            !openAiPattern.IsMatch("openai-example.com"), "required redirect pattern matching failed");
+        Regex openAiComPattern = NextDnsRunner.BuildRequiredRedirectMatcher("*.openai.com");
+        Assert(openAiComPattern.IsMatch("openai.com") && openAiComPattern.IsMatch("android.chat.openai.com") &&
+            !openAiComPattern.IsMatch("openai.com.example"), "required redirect suffix matching failed");
 
         await TestRewriteLimitAsync();
+        await TestExclusionsWithoutSourcesAsync();
         Console.WriteLine("Self-test completed successfully");
     }
 
@@ -659,17 +806,44 @@ internal static class SelfTest
         existingRewrites.Add(new RewriteDto("exclude", "exclude.test", "1.2.3.4"));
 
         DnsProfile profile = new(1, "test", "test");
-        AppSettings settings = new([profile], [], ["https://hosts.test/rewrites"], ["exclude.test"]);
+        AppSettings settings = new([profile], [], ["https://hosts.test/rewrites"], ["exclude.test"],
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "*.openai.*", "android.chat.openai.com" });
         using RewriteTestHandler handler = new(existingRewrites);
         using HttpClient httpClient = new(handler);
         NextDnsRunner runner = new(new NextDnsClient(httpClient, profile), new HostsListLoader(httpClient), settings);
 
         await runner.RunAsync();
-        Assert(handler.SavedNames.SequenceEqual(["update.test", "first.test"]), "rewrite capacity or priority was incorrect");
+        Assert(handler.SavedNames.SequenceEqual(["android.chat.openai.com", "update.test"]), "rewrite capacity or priority was incorrect");
         Assert(existingRewrites.Count == 500, "expected exactly 500 rewrites after the sync");
 
         await runner.RunAsync();
         Assert(handler.SavedNames.Count == 2, "full profile should skip pending rewrites without posting");
+
+        NextDnsRunner fullProfileRunner = new(new NextDnsClient(httpClient, profile), new HostsListLoader(httpClient),
+            settings with { RequiredRedirects = new HashSet<string> { "first.test" } });
+        try
+        {
+            await fullProfileRunner.RunAsync();
+            Assert(false, "a missing required rewrite in a full profile should fail");
+        }
+        catch (ProcessException exception) when (exception.Message.Contains("Free 1 NextDNS rewrite slot(s) for required domains: first.test"))
+        {
+            Assert(handler.SavedNames.Count == 2 && existingRewrites.Count == 500, "capacity check should leave rewrites intact");
+        }
+    }
+
+    private static async Task TestExclusionsWithoutSourcesAsync()
+    {
+        RewriteDto keptRewrite = new("keep", "keep.test", "1.2.3.4");
+        List<RewriteDto> existingRewrites = [new RewriteDto("exclude", "tracker.rutor.is", "1.2.3.4"), keptRewrite];
+        DnsProfile profile = new(1, "test", "test");
+        AppSettings settings = new([profile], [], [], ["rutor"], new HashSet<string>());
+        using RewriteTestHandler handler = new(existingRewrites);
+        using HttpClient httpClient = new(handler);
+        NextDnsRunner runner = new(new NextDnsClient(httpClient, profile), new HostsListLoader(httpClient), settings);
+
+        await runner.RunAsync();
+        Assert(existingRewrites.SequenceEqual([keptRewrite]), "exclusions-only sync should remove only matching rewrites");
     }
 
     private sealed class RewriteTestHandler(List<RewriteDto> rewrites) : HttpMessageHandler
@@ -681,9 +855,10 @@ internal static class SelfTest
             Uri uri = request.RequestUri!;
             if (uri.Host == "hosts.test")
             {
+                Assert(rewrites.All(rewrite => rewrite.Name != "exclude.test"), "excluded rewrite was still present when loading sources");
                 return new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Content = new StringContent("5.6.7.8 first.test\n5.6.7.8 second.test\n5.6.7.8 update.test\n5.6.7.8 exclude.test")
+                    Content = new StringContent("5.6.7.8 first.test\n5.6.7.8 android.chat.openai.com\n5.6.7.8 update.test\n5.6.7.8 exclude.test")
                 };
             }
 

@@ -13,6 +13,7 @@ jobs:
     env:
       BLOCK: ${{ vars.BLOCK }}
       REDIRECT: ${{ vars.REDIRECT }}
+      REQUIRED_REDIRECT: ${{ vars.REQUIRED_REDIRECT }}
       EXCLUDE_REDIRECT: ${{ vars.EXCLUDE_REDIRECT }}
 
       CLIENT_ID: ${{ secrets.CLIENT_ID }}

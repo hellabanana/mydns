@@ -36,14 +36,16 @@ AUTH_SECRET=api_key_1,api_key_2
 
 - `BLOCK` - ссылки на hosts-файлы для блокировки доменов.
 - `REDIRECT` - ссылки на hosts-файлы для DNS-перенаправлений.
-- `EXCLUDE_REDIRECT` - домены, которые нужно исключить из rewrites.
+- `REQUIRED_REDIRECT` — домены или шаблоны через запятую для приоритетного добавления из `REDIRECT`. Шаблон `*.openai.com` включает `openai.com` и все его поддомены, а `*.openai.*` также включает имена с другими окончаниями, например `openai.net`. Одиночная `*` выбирает все домены. Исключения из `EXCLUDE_REDIRECT` действуют и для шаблонов. Если у шаблона нет подходящих записей или обязательные правила не помещаются в профиль, синхронизация сообщит об ошибке.
+- `EXCLUDE_REDIRECT` — исключения через запятую. Значение без точки, например `rutor`, совпадает с любой частью имени домена. Значение с точкой проверяется по окончанию имени. Регистр не учитывается.
 
 Несколько источников или доменов указываются через запятую:
 
 ```text
 BLOCK=https://first.example/hosts,https://second.example/hosts
 REDIRECT=https://example.com/redirect-hosts
-EXCLUDE_REDIRECT=instagram.com,twitch.com
+REQUIRED_REDIRECT=*.openai.*,*.chatgpt.com
+EXCLUDE_REDIRECT=rutor,instagram.com,twitch.com
 ```
 
 ## Формат hosts-файлов
@@ -76,7 +78,7 @@ EXCLUDE_REDIRECT=instagram.com,twitch.com
 - добавляет новые правила;
 - удаляет и пропускает домены из `EXCLUDE_REDIRECT`.
 
-Если `BLOCK` пуст, Denylist не изменяется. Если `REDIRECT` пуст, Rewrites не изменяются. Если одновременно пусты `BLOCK` и `REDIRECT`, приложение удаляет все Denylist и Rewrites в профиле.
+В начале синхронизации каждого профиля приложение удаляет существующие rewrites, которые совпадают с `EXCLUDE_REDIRECT`, даже если `REDIRECT` пуст. Если задан только `EXCLUDE_REDIRECT`, выполняется только эта очистка. Если одновременно пусты `BLOCK`, `REDIRECT` и `EXCLUDE_REDIRECT`, приложение удаляет все записи Denylist и Rewrites в профиле.
 
 ## GitHub Actions
 
@@ -84,7 +86,7 @@ EXCLUDE_REDIRECT=instagram.com,twitch.com
 2. Перейдите в Settings -> Environments.
 3. Создайте environment с именем `DNS`.
 4. Добавьте `CLIENT_ID` и `AUTH_SECRET` в Environment secrets.
-5. Добавьте `BLOCK`, `REDIRECT` и `EXCLUDE_REDIRECT` в Environment variables.
+5. Добавьте нужные переменные `BLOCK`, `REDIRECT`, `REQUIRED_REDIRECT` и `EXCLUDE_REDIRECT` в Environment variables.
 
 Workflow запускается ежедневно в `01:30 UTC` и может быть запущен вручную через вкладку Actions.
 
@@ -97,10 +99,15 @@ Workflow запускается ежедневно в `01:30 UTC` и может 
 ```shell
 dotnet restore
 dotnet build
+```
+
+Для запуска с тестовым профилем NextDNS скопируйте `.env.example` в `.env` и укажите ID профиля и ключ API. Запустите приложение из каталога проекта. Оно загрузит `.env` из рабочей папки. Уже заданные переменные окружения имеют приоритет.
+
+```shell
 dotnet run
 ```
 
-Для проверки парсинга без обращения к NextDNS API:
+Для запуска самопроверки без обращения к NextDNS API:
 
 ```shell
 dotnet run -- --self-test

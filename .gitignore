@@ -1,5 +1,6 @@
 bin/
 obj/
+/.env
 TestResults/
 .vs/
 *.user
