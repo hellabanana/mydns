@@ -6,7 +6,7 @@ using System.Text.RegularExpressions;
 
 if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase))
 {
-    SelfTest.Run();
+    await SelfTest.RunAsync();
     return;
 }
 
@@ -65,6 +65,8 @@ static async Task RunProfileAsync(
 
 internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsListLoader, AppSettings settings)
 {
+    private const int RewriteLimit = 500;
+
     public async Task RunAsync()
     {
         if (settings.BlockSources.Count > 0)
@@ -99,7 +101,7 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
 
             ConsoleLogger.Step("Prepare rewrites");
             Dictionary<string, CreateRewriteRequest> newRewrites = BuildNewRewrites(overrides);
-            List<CreateRewriteRequest> rewritesToCreate = await CleanupOutdatedAndExcludedAsync(newRewrites);
+            List<CreateRewriteRequest> rewritesToCreate = await PrepareRewritesAsync(newRewrites);
 
             ConsoleLogger.Step("Save rewrites");
             await NextDnsRateLimitedApiProcessor.CallApiAsync(rewritesToCreate, client.SaveRewriteAsync);
@@ -128,7 +130,7 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
         return rewriteRequests;
     }
 
-    private async Task<List<CreateRewriteRequest>> CleanupOutdatedAndExcludedAsync(
+    private async Task<List<CreateRewriteRequest>> PrepareRewritesAsync(
         Dictionary<string, CreateRewriteRequest> newRewriteRequests)
     {
         ConsoleLogger.Io("Fetching existing rewrites from NextDNS");
@@ -136,13 +138,14 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
 
         List<string> outdatedIds = [];
         List<string> excludedIds = [];
+        HashSet<string> outdatedNames = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> matchingNames = new(StringComparer.OrdinalIgnoreCase);
 
         foreach (RewriteDto existingRewrite in existingRewrites)
         {
             if (settings.ShouldExcludeRedirect(existingRewrite.Name))
             {
                 excludedIds.Add(existingRewrite.Id);
-                newRewriteRequests.Remove(existingRewrite.Name);
                 continue;
             }
 
@@ -151,32 +154,46 @@ internal sealed class NextDnsRunner(NextDnsClient client, HostsListLoader hostsL
                 if (!string.Equals(request.Content, existingRewrite.Content, StringComparison.OrdinalIgnoreCase))
                 {
                     outdatedIds.Add(existingRewrite.Id);
+                    outdatedNames.Add(existingRewrite.Name);
                 }
                 else
                 {
-                    newRewriteRequests.Remove(existingRewrite.Name);
+                    matchingNames.Add(existingRewrite.Name);
                 }
             }
         }
 
+        int removedCount = 0;
         if (outdatedIds.Count > 0)
         {
             ConsoleLogger.Io($"Removing {outdatedIds.Count} outdated rewrites from NextDNS");
-            await NextDnsRateLimitedApiProcessor.CallApiAsync(outdatedIds, client.DeleteRewriteByIdAsync);
+            removedCount += await NextDnsRateLimitedApiProcessor.CallApiAsync(outdatedIds, client.DeleteRewriteByIdAsync);
         }
 
         if (excludedIds.Count > 0)
         {
             ConsoleLogger.Io($"Removing {excludedIds.Count} excluded rewrites from NextDNS");
-            await NextDnsRateLimitedApiProcessor.CallApiAsync(excludedIds, client.DeleteRewriteByIdAsync);
+            removedCount += await NextDnsRateLimitedApiProcessor.CallApiAsync(excludedIds, client.DeleteRewriteByIdAsync);
         }
 
-        foreach (string excludedDomain in newRewriteRequests.Keys.Where(settings.ShouldExcludeRedirect).ToList())
+        if (removedCount != outdatedIds.Count + excludedIds.Count)
         {
-            newRewriteRequests.Remove(excludedDomain);
+            throw new ProcessException($"Profile {client.ProfileNumber}: NextDNS failed to remove one or more rewrites");
         }
 
-        return [.. newRewriteRequests.Values];
+        List<CreateRewriteRequest> pendingRewrites = newRewriteRequests.Values
+            .Where(request => !matchingNames.Contains(request.Name) && !settings.ShouldExcludeRedirect(request.Name))
+            .OrderByDescending(request => outdatedNames.Contains(request.Name))
+            .ToList();
+
+        int availableSlots = Math.Max(0, RewriteLimit - (existingRewrites.Count - removedCount));
+        if (pendingRewrites.Count > availableSlots)
+        {
+            ConsoleLogger.Warn($"Profile {client.ProfileNumber}: NextDNS rewrite limit is {RewriteLimit}. " +
+                $"Saving {availableSlots} of {pendingRewrites.Count} pending rewrites and deferring {pendingRewrites.Count - availableSlots}.");
+        }
+
+        return pendingRewrites.Take(availableSlots).ToList();
     }
 
     private async Task RemoveAllAsync()
@@ -203,6 +220,7 @@ internal sealed class NextDnsClient(HttpClient httpClient, DnsProfile profile)
     };
 
     private string ApiUrl => $"https://api.nextdns.io/profiles/{profile.ClientId}";
+    public int ProfileNumber => profile.Number;
 
     public async Task<List<DenyDto>> FetchDenyListAsync()
     {
@@ -226,9 +244,17 @@ internal sealed class NextDnsClient(HttpClient httpClient, DnsProfile profile)
         return response?.Data ?? [];
     }
 
-    public Task<NextDnsResponse<RewriteDto>?> SaveRewriteAsync(CreateRewriteRequest request)
+    public async Task<NextDnsResponse<RewriteDto>?> SaveRewriteAsync(CreateRewriteRequest request)
     {
-        return SendAsync<NextDnsResponse<RewriteDto>>(HttpMethod.Post, "/rewrites", request);
+        try
+        {
+            return await SendAsync<NextDnsResponse<RewriteDto>>(HttpMethod.Post, "/rewrites", request);
+        }
+        catch (NextDnsHttpException exception) when (exception.IsRewriteLimitExceeded())
+        {
+            throw new ProcessException($"Profile {ProfileNumber}: NextDNS reached its rewrite limit while saving {request.Name}. " +
+                "Rerun the sync to recalculate available slots.");
+        }
     }
 
     public Task<NextDnsResponse<RewriteDto>?> DeleteRewriteByIdAsync(string id)
@@ -326,7 +352,7 @@ internal sealed class NextDnsClient(HttpClient httpClient, DnsProfile profile)
 
 internal static class NextDnsRateLimitedApiProcessor
 {
-    public static async Task CallApiAsync<TRequest, TResponse>(
+    public static async Task<int> CallApiAsync<TRequest, TResponse>(
         IReadOnlyCollection<TRequest> requests,
         Func<TRequest, Task<TResponse?>> callApi)
         where TResponse : NextDnsResponseBase
@@ -365,6 +391,7 @@ internal static class NextDnsRateLimitedApiProcessor
         }
 
         ConsoleLogger.Common("Completed");
+        return successCounter;
     }
 
     private static async Task RunResetWaitTimerAsync(int seconds)
@@ -569,6 +596,18 @@ internal sealed class NextDnsHttpException(HttpStatusCode statusCode, string res
     : Exception($"NextDNS HTTP error {(int)statusCode}: {responseBody}")
 {
     public HttpStatusCode StatusCode { get; } = statusCode;
+
+    public bool IsRewriteLimitExceeded()
+    {
+        if (StatusCode != HttpStatusCode.BadRequest)
+        {
+            return false;
+        }
+
+        NextDnsResponse<RewriteDto>? response = JsonSerializer.Deserialize<NextDnsResponse<RewriteDto>>(
+            responseBody, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        return response?.Errors?.Any(error => error is { Code: "listLimitExceeded", List: "rewrites" }) == true;
+    }
 }
 
 internal static class ConsoleLogger
@@ -583,12 +622,14 @@ internal static class ConsoleLogger
 
     public static void Progress(string message) => Console.WriteLine(message);
 
+    public static void Warn(string message) => Console.WriteLine($"Warning: {message}");
+
     public static void Fail(string message) => Console.Error.WriteLine(message);
 }
 
 internal static class SelfTest
 {
-    public static void Run()
+    public static async Task RunAsync()
     {
         HostsLine? block = HostsListLoader.ParseHostsLine("0.0.0.0 www.example.com # comment");
         Assert(block is { Ip: "0.0.0.0", Domain: "example.com" }, "block hosts parsing failed");
@@ -605,7 +646,65 @@ internal static class SelfTest
         AppSettings settings = new([], [], [], ["example.com"]);
         Assert(settings.ShouldExcludeRedirect("sub.example.com"), "subdomain exclusion failed");
 
+        await TestRewriteLimitAsync();
         Console.WriteLine("Self-test completed successfully");
+    }
+
+    private static async Task TestRewriteLimitAsync()
+    {
+        List<RewriteDto> existingRewrites = Enumerable.Range(0, 498)
+            .Select(index => new RewriteDto($"keep-{index}", $"keep-{index}.test", "1.2.3.4"))
+            .ToList();
+        existingRewrites.Add(new RewriteDto("update", "update.test", "1.2.3.4"));
+        existingRewrites.Add(new RewriteDto("exclude", "exclude.test", "1.2.3.4"));
+
+        DnsProfile profile = new(1, "test", "test");
+        AppSettings settings = new([profile], [], ["https://hosts.test/rewrites"], ["exclude.test"]);
+        using RewriteTestHandler handler = new(existingRewrites);
+        using HttpClient httpClient = new(handler);
+        NextDnsRunner runner = new(new NextDnsClient(httpClient, profile), new HostsListLoader(httpClient), settings);
+
+        await runner.RunAsync();
+        Assert(handler.SavedNames.SequenceEqual(["update.test", "first.test"]), "rewrite capacity or priority was incorrect");
+        Assert(existingRewrites.Count == 500, "expected exactly 500 rewrites after the sync");
+
+        await runner.RunAsync();
+        Assert(handler.SavedNames.Count == 2, "full profile should skip pending rewrites without posting");
+    }
+
+    private sealed class RewriteTestHandler(List<RewriteDto> rewrites) : HttpMessageHandler
+    {
+        public List<string> SavedNames { get; } = [];
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Uri uri = request.RequestUri!;
+            if (uri.Host == "hosts.test")
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("5.6.7.8 first.test\n5.6.7.8 second.test\n5.6.7.8 update.test\n5.6.7.8 exclude.test")
+                };
+            }
+
+            if (request.Method == HttpMethod.Get && uri.AbsolutePath.EndsWith("/rewrites", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(new { data = rewrites }) };
+            }
+
+            if (request.Method == HttpMethod.Delete)
+            {
+                string id = uri.Segments[^1];
+                Assert(rewrites.RemoveAll(rewrite => rewrite.Id == id) == 1, "unexpected rewrite deletion");
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
+            }
+
+            Assert(request.Method == HttpMethod.Post && rewrites.Count < 500, "unexpected request or rewrite limit exceeded");
+            CreateRewriteRequest rewrite = (await request.Content!.ReadFromJsonAsync<CreateRewriteRequest>(cancellationToken))!;
+            rewrites.Add(new RewriteDto(rewrite.Name, rewrite.Name, rewrite.Content));
+            SavedNames.Add(rewrite.Name);
+            return new HttpResponseMessage(HttpStatusCode.NoContent);
+        }
     }
 
     private static void Assert(bool condition, string message)

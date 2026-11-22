@@ -27,7 +27,7 @@ internal sealed record DenyDto(string Id, bool Active);
 
 internal sealed record RewriteDto(string Id, string Name, string Content);
 
-internal sealed record NextDnsApiError(string Code);
+internal sealed record NextDnsApiError(string Code, string? List);
 
 internal abstract class NextDnsResponseBase
 {
